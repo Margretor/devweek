@@ -1,0 +1,22 @@
+#cert-manager
+kubectl create namespace cert-manager
+kubectl apply --validate=false -f https://github.com/jetstack/cert-manager/releases/download/v0.16.0/cert-manager.crds.yaml;
+helm --namespace cert-manager upgrade --install cert-manager jetstack/cert-manager --version v0.16.0 --set ingressShim.defaultIssuerName=letsencrypt-prod --set ingressShim.defaultIssuerKind=ClusterIssuer --set ingressShim.defaultIssuerGroup=cert-manager.io && kubectl -n cert-manager wait --for=condition=Available deployment/cert-manager --timeout=300s;
+
+#presslabs
+mkdir -p $GOPATH/src/sigs.k8s.io;
+cd $GOPATH/src/sigs.k8s.io;
+git clone https://github.com/kubernetes-sigs/application.git
+make deploy
+kubectl -n application-system wait --for=condition=Available deployment/kube-app-manager-controller --timeout=300s;
+
+kubectl apply -f letsencrypt_certmanager.yaml
+#presslabs
+nano stack-values.yaml 
+kubectl create namespace presslabs-system
+helm --namespace=presslabs-system upgrade --install stack presslabs/stack --values ${PWD}/stack-values.yaml && kubectl -n presslabs-system wait --for=condition=Available deployment/stack-wordpress-operator --timeout=300s;
+
+kubectl create namespace wp01
+helm -n wp01 upgrade --install wp01 presslabs/wordpress-site --set site.domains[0]=wp01.donein30.org --set ingressClass=nginx --set tls.issuerName=letsencrypt-prod --set tls.issuerClass=nginx
+
+wp theme install twentytwenty --activate

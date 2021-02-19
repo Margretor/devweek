@@ -1,0 +1,45 @@
+letsencrypt:
+  enabled: true
+  email: "octaviannicolae.mihalache@ionos.com"
+  server: https://acme-v02.api.letsencrypt.org/directory
+wordpress-operator:
+  enabled: true
+  crd:
+    install: false
+  extraArgs:
+  - --ingress-class=nginx
+mysql-operator:
+  enabled: true
+  installCRDs: false
+  orchestrator:
+    topologyPassword: this-must-be-set-in-stone-because-of-mysql-operator-bug-75
+    image: quay.io/presslabs/orchestrator:v3.0.14-r37
+    replicas: 1
+nginx-ingress:
+  enabled: false
+  controller:
+    ingressClass: nginx
+    config:
+      proxy-buffer-size: 64k
+      custom-http-errors: 502,503,504
+      hsts-preload: "true"
+    addHeaders:
+      server: nginx
+    publishService:
+      enabled: true
+  defaultBackend:
+    image:
+      repository: quay.io/presslabs/default-backend
+      tag: 0.9.1
+      pullPolicy: Always
+cert-manager:
+  enabled: false
+  installCRDs: false
+prometheus-operator:
+  enabled: true
+  prometheusOperator:
+    createCustomResource: false
+git-webhook:
+  enabled: true
+  image:
+    tag: 0.9.1

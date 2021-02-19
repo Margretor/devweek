@@ -1,0 +1,271 @@
+The Infrastructure
+
+First of all, we need to create ourselves some infrartructure on Ionos Cloud, so let's see what we need:
+
+    A managed Kubernetes cluster
+
+    A VDC to place our Kubernetes node(s) into
+
+    An additional LAN for our Kubernetes nodes to be a part of, just in case we need to reach in from another server in the same VDC
+
+    Finally, a Kubernetes Node Pool with an initial node count of 1, with dynamic node autoscaling to a maximum of 3 nodes, just in case our WordPress as a Service encounters a spike in demand.
+
+What would be the easiest way to create infrastructure? HashiCorp's Terraform, of course!
+
+Now, let's see how exactly we can provision our infrastructure:
+
+    First of all, we need to create an empty directory and cd to it
+
+    mkdir -p wp-aas && cd wp-aas
+
+    Once inside our newly created wp-aas directory, we need to create a file called ionos-cloud.env, with the following content
+
+    export PROFITBRICKS_USERNAME=<your-ionos-cloud-username>
+    export PROFITBRICKS_PASSWORD=<your-ionos-cloud-password>
+
+    Let's make sure our terraform provider connects to the Ionos Cloud API using the right credentials we've just created above
+
+    source ionos-cloud.env
+
+    Next up, we need to create our Terraform configuration file, called main.tf
+
+    provider "profitbricks" {
+      version = "~> 1.5.4"
+    }
+
+    # Managed Kubernetes Cluster
+    resource "profitbricks_k8s_cluster" "wp_hoster" {
+      name        = "wp_hoster"
+      k8s_version = "1.18.5"
+      depends_on = [ profitbricks_datacenter.vdc1 ]
+      maintenance_window {
+        day_of_the_week = "Sunday"
+        time = "10:30:00Z"
+      }
+    }
+
+    # VDC1 (de/fra)
+    resource "profitbricks_datacenter" "vdc1" {
+      name        = "vdc1"
+      location    = "de/fra"
+    }
+
+    # Crossconnect LANs
+    resource "profitbricks_lan" "crosslink_vdc1" {
+      datacenter_id = profitbricks_datacenter.vdc1.id
+      name          = "crosslink"
+      public        = false
+      # pcc           = profitbricks_private_crossconnect.crosslink.id
+    }
+
+    # VDC1 (de/fra) Node pool
+    resource "profitbricks_k8s_node_pool" "wp_hoster_vdc1" {
+        availability_zone = "AUTO"
+        cores_count       = 2
+        cpu_family        = "INTEL_XEON"
+        datacenter_id     = profitbricks_datacenter.vdc1.id
+        k8s_cluster_id    = profitbricks_k8s_cluster.wp_hoster.id
+        k8s_version       = "1.18.5"
+        name              = "wp_hoster_vdc1"
+        node_count        = 1
+        ram_size          = 8192
+        storage_size      = 120
+        storage_type      = "SSD"
+        depends_on        = [ profitbricks_k8s_cluster.wp_hoster ]
+        auto_scaling {
+            max_node_count = 3
+            min_node_count = 1
+        }
+        lans = [ profitbricks_lan.crosslink_vdc1.id ]
+        maintenance_window {
+            day_of_the_week = "Saturday"
+            time            = "09:00:00Z"
+        }
+    }
+
+    Having created our Terraform configuration file, let's plan & build the aforementioned infrastructure, and in that process, get our kubeconfig file as well, so that we're ready to run kubectl commands as soon as the command exits
+
+    # First, we plan our infrastructure
+    terraform plan -out wp.plan && \
+    # Next, we build it
+    terraform apply wp.plan && \
+    # Finally, we make sure we can connect to it
+    curl -sS --user "${PROFITBRICKS_USERNAME}:${PROFITBRICKS_PASSWORD}" "https://api.ionos.com/cloudapi/v5/k8s/$(terraform show | grep k8s_cluster_id | awk '{print $3}' | sed 's/"//g')/kubeconfig" | jq -r ".properties.kubeconfig" > ./kubeconfig.yaml
+
+    If the command above executed has been executed successfully, please check that everything works as expected by running the following commands
+
+    export KUBECONFIG=${PWD}/kubeconfig.yaml;
+
+    kubectl get nodes -o wide
+
+    The output of the last command should return a list of all the node(s) (in our case, a single one) in the cluster. This is our indication of success
+
+Getting up and running
+
+Now that we have our infrastructure, we can carry on with our plan of conquering the internet by getting our shop up n' running, so let's get cracking:
+
+    Let's make sure we connect to the newly created cluster
+
+    export KUBECONFIG=${PWD}/kubeconfig.yaml;
+
+    Let's install the Nginx Ingress Controller into our cluster
+
+    helm -n kube-system upgrade --install nginx-ingress stable/nginx-ingress --version 1.41.2 --set controller.service.enabled=true --set controller.hostNetwork=false --set controller.kind=DaemonSet --set controller.service.externalTrafficPolicy=Local;
+
+    Next, let's install the cert-manager helm chart
+
+        Create the namespace the cert-manager will be residing into
+
+        kubectl create namespace cert-manager;
+
+        Finally, let's install cert-manager chart and wait for it to be ready
+
+        kubectl apply --validate=false -f https://github.com/jetstack/cert-manager/releases/download/v0.16.0/cert-manager.crds.yaml;
+        helm --namespace cert-manager upgrade --install cert-manager jetstack/cert-manager --version v0.16.0 --set ingressShim.defaultIssuerName=letsencrypt-prod --set ingressShim.defaultIssuerKind=ClusterIssuer --set ingressShim.defaultIssuerGroup=cert-manager.io && kubectl -n cert-manager wait --for=condition=Available deployment/cert-manager --timeout=300s;
+
+    Let's install the CRD's required by our WordPress as a Service platform components
+
+    kustomize build github.com/presslabs/stack/deploy/manifests | kubectl apply -f -
+
+    Next up, we need to install the Kubernetes Applications Controller - this is a prerequisite for our WordPress Operator
+
+    NOTE: It is crucial that your working directory returns to the wp-aas directory after the commands below execute
+
+    export ORIGINAL_DIR=${PWD}
+    rm -fr $GOPATH/src/sigs.k8s.io/application;
+    mkdir -p $GOPATH/src/sigs.k8s.io;
+    cd $GOPATH/src/sigs.k8s.io;
+    git clone git@github.com:kubernetes-sigs/application.git;
+    cd ./application;
+    make deploy;
+    kubectl -n application-system wait --for=condition=Available deployment/kube-app-manager-controller --timeout=300s;
+    cd ${ORIGINAL_DIR};
+
+    Next, we need to create a file called stack-values.yaml - this file will contain our helm release values for the stack helm package (the package containing our WordPress Operator)
+
+    NOTE: Please replace \<email>@\<domain> string below with the email address that belongs to you
+
+    cat << 'EOF' > stack-values.yaml
+    letsencrypt:
+      enabled: true
+      email: "<email>@<domain>"
+      server: https://acme-v02.api.letsencrypt.org/directory
+    wordpress-operator:
+      enabled: true
+      crd:
+        install: false
+      extraArgs:
+      - --ingress-class=nginx
+    mysql-operator:
+      enabled: true
+      installCRDs: false
+      orchestrator:
+        topologyPassword: this-must-be-set-in-stone-because-of-mysql-operator-bug-75
+        image: quay.io/presslabs/orchestrator:v3.0.14-r37
+        replicas: 1
+    nginx-ingress:
+      enabled: false
+      controller:
+        ingressClass: nginx
+        config:
+          proxy-buffer-size: 64k
+          custom-http-errors: 502,503,504
+          hsts-preload: "true"
+        addHeaders:
+          server: nginx
+        publishService:
+          enabled: true
+      defaultBackend:
+        image:
+          repository: quay.io/presslabs/default-backend
+          tag: 0.9.1
+          pullPolicy: Always
+    cert-manager:
+      enabled: false
+      installCRDs: false
+    prometheus-operator:
+      enabled: true
+      prometheusOperator:
+        createCustomResource: false
+    git-webhook:
+      enabled: true
+      image:
+        tag: 0.9.1
+    EOF
+
+    Now, let's install our WordPress as a Service platform & operator
+
+        Create a namespace called presslabs-system - This is where all the components of our WordPress as a Service platform reside
+
+        kubectl create namespace presslabs-system
+
+        Finally, install our WPaaS components, and wait for them to be ready
+
+        helm --namespace=presslabs-system upgrade --install stack presslabs/stack --values ${PWD}/stack-values.yaml && kubectl -n presslabs-system wait --for=condition=Available deployment/stack-wordpress-operator --timeout=300s;
+
+    Now, let's define a ClusterIssuer CR, so that CertManager knows how to issue our SSL certificates automatically through letsencrypt - I would have loved for CertManager to be able to issue certificates through our own platform.
+
+    NOTE: Please replace <email>@<domain> string below with the email address that belongs to you
+
+    cat << 'EOF' | kubectl apply -f -
+    apiVersion: cert-manager.io/v1alpha3
+    kind: ClusterIssuer
+    metadata:
+      name: letsencrypt-prod
+    spec:
+      acme:
+        email: <email>@<domain>
+        server: "https://acme-v02.api.letsencrypt.org/directory"
+        privateKeySecretRef:
+          name: letsencrypt-account-key
+        solvers:
+        - http01:
+            ingress:
+              class: nginx
+    EOF
+
+    Now, we need to retreive the LoadBalancer IP for our ingress service:
+
+    echo  "Your Ingress IP is: $(kubectl -n kube-system get svc nginx-ingress-controller -ojsonpath='{.status.loadBalancer.ingress[0].ip}')"
+
+    Next, we need to update our IONOS domain's A records accordingly:
+        Log into https://my.ionos.com/
+        Click the "Domains & SSL" badge
+        Click the gear icon to the right of the domain name we want to host WPaaS setup on
+        From the dropdown, Select the DNS option
+        Click the gear to the right of the "ADD RECORD" button
+        Select A record type in the list that will appear on the screen
+        Fill the record form as the following
+            Host Name: *
+            Points To: The LoadBalancer's IP address you have retreived in the previous step
+            TTL: This is up to you - I usually go for a reasonable value in order to keep a good balance between propagation speed and performance
+
+    Now that that's done, let's test that it works
+
+    NOTE: Please replace the \<your-domain>.com string with the actual domain name
+
+    dig +short foo.<your-domain>.com
+
+    If everything is how it should be, the output of the command above should
+
+Showcasing our newly created WPaaS service's functionality
+
+    First, let's create a namespace where our first dedicated wordpress instance will be hosted
+
+    kubectl create namespace wp01;
+
+    Now, let's finally create our first WordPress Instance and see it come to life
+
+        Deploy our first wordpress site
+
+        NOTE: Please replace the \<your-domain>.com string with the actual domain name
+
+        helm -n wp01 upgrade --install wp01 presslabs/wordpress-site --set site.domains[0]=wp01.<your-domain>.com --set ingressClass=nginx --set tls.issuerName=letsencrypt-prod --set tls.issuerClass=nginx
+
+        Watch it come to life
+
+        kubectl -n wp01 get pods -w -o wide
+
+    Once everything is up and running, go to https://\<your-domain>.com in your browser, and finish up your wordpress configuration.
+
+    That's it! Hope you have enjoyed it the read, even though it was quite lengthy
